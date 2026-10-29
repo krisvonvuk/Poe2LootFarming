@@ -43,16 +43,18 @@ Files it reads (produced by your run logger / poe2agent.py):
     }
   Older single-tablet files ("tablet_used") are still accepted, but
   until poe2agent.py emits the full format, biome will show as "unknown
-  biome", patch filtering passes everything through, and the
-  "most common drops" chart stays empty. Enricher TODO list:
+  biome", --patch/--since filters exclude runs missing those fields, and
+  the "most common drops" chart stays empty. Enricher TODO list:
     - tablets_used: list (not single tablet_used)
     - biome: from run notes
     - patch: e.g. "0.5.5", set once per patch
+    - started_at: ISO timestamp (needed by --since)
     - loot: [{"name": ..., "count": N}] per item, from captured drops
     - waystone_used.mods: raw modifier text lines (check command reads these)
 
-  strategies.json (optional, same dir as this script) overrides the
-  built-in TARGETS dict, so patch updates need no code edits.
+  strategies.json (optional, same dir as this script) is merged over the
+  built-in TARGETS dict: edit or add per-target entries without code
+  changes; unknown keys add new targets.
 
 Environment:
   OLLAMA_URL   (default http://localhost:11434)
@@ -343,7 +345,11 @@ def load_targets():
             with open(path, encoding="utf-8") as fh:
                 override = json.load(fh)
             if isinstance(override, dict) and override:
-                targets = override
+                for tid, t in override.items():
+                    if isinstance(t, dict):
+                        merged = dict(targets.get(tid, {}))
+                        merged.update(t)
+                        targets[tid] = merged
         except (OSError, json.JSONDecodeError) as e:
             print(f"warning: strategies.json unreadable ({e}); "
                   "using built-ins", file=sys.stderr)
@@ -402,11 +408,11 @@ def load_runs(patch=None, since=None):
                 r = normalise_run(json.load(fh))
         except (OSError, json.JSONDecodeError):
             continue
-        if patch and r.get("patch") and r["patch"] != patch:
+        if patch and r.get("patch") != patch:
             continue
         if since:
             ts = r.get("started_at") or r.get("timestamp") or ""
-            if ts and ts < since:
+            if not ts or ts < since:
                 continue
         runs.append(r)
     return runs
