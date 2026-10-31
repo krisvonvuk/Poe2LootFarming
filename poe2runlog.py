@@ -323,6 +323,98 @@ def watch_wayland_poll(path, mode):
     print("Watcher stopped. Run file saved.")
 
 
+def clipboard_get_x11():
+    """One-shot clipboard read preferring the X11 path (for XWayland
+    games this avoids touching the Wayland compositor at all)."""
+    if shutil.which("xclip"):
+        try:
+            proc = subprocess.run(["xclip", "-o", "-selection", "clipboard"],
+                                  capture_output=True, text=True, timeout=2)
+            if proc.returncode == 0:
+                return proc.stdout
+        except Exception:
+            pass
+    return clipboard_get()
+
+
+def watch_x11_events(path, mode):
+    """Event-driven X11/XWayland watcher via XFixes selection-owner
+    notifications. The X server tells us ONLY when the clipboard owner
+    changes (i.e. when something is actually copied); there is no
+    polling and no repeated subprocess spawn, so the game never sees
+    focus flicker. This works for games running through XWayland
+    (Steam/Proton) even on Wayland desktops like GNOME.
+
+    Returns False if it could not start (no display, missing libs);
+    returns True after running to completion (Ctrl+C).
+    """
+    import ctypes
+    from ctypes import c_int, c_long, c_ulong, c_void_p, c_char_p, byref
+    try:
+        xlib = ctypes.CDLL("libX11.so.6")
+        xfixes = ctypes.CDLL("libXfixes.so.3")
+    except OSError:
+        return False
+    xlib.XOpenDisplay.restype = c_void_p
+    dpy = xlib.XOpenDisplay(None)
+    if not dpy:
+        return False
+    try:
+        xlib.XInternAtom.restype = c_ulong
+        xlib.XInternAtom.argtypes = [c_void_p, c_char_p, c_int]
+        clipboard = xlib.XInternAtom(dpy, b"CLIPBOARD", 0)
+        xlib.XDefaultRootWindow.restype = c_ulong
+        xlib.XDefaultRootWindow.argtypes = [c_void_p]
+        root = xlib.XDefaultRootWindow(dpy)
+        event_base, error_base = c_int(), c_int()
+        xfixes.XFixesQueryExtension.restype = c_int
+        xfixes.XFixesQueryExtension.argtypes = [
+            c_void_p, ctypes.POINTER(c_int), ctypes.POINTER(c_int)]
+        if not xfixes.XFixesQueryExtension(dpy, byref(event_base),
+                                           byref(error_base)):
+            return False
+        # XFixesSetSelectionOwnerNotifyMask
+        xfixes.XFixesSelectSelectionInput.argtypes = [c_void_p, c_ulong,
+                                                       c_ulong, c_ulong]
+        xfixes.XFixesSelectSelectionInput(dpy, root, clipboard, 0x1)
+        xlib.XFlush.argtypes = [c_void_p]
+        xlib.XFlush(dpy)
+        xlib.XPending.restype = c_int
+        xlib.XPending.argtypes = [c_void_p]
+        xlib.XNextEvent.argtypes = [c_void_p, c_void_p]
+
+        print("Watching clipboard (X11/XWayland events, zero polling). "
+              "Ctrl+C here to stop.")
+        seen = None
+        ev = (c_long * 24)()
+        ev_type = ctypes.cast(ev, ctypes.POINTER(c_int))
+        try:
+            while True:
+                if not xlib.XPending(dpy):
+                    time.sleep(0.1)
+                    continue
+                xlib.XNextEvent(dpy, ev)
+                if ev_type[0] == event_base.value:
+                    # owner changed: give the new owner a moment to
+                    # finish serving the data, then read once
+                    time.sleep(0.15)
+                    raw = clipboard_get_x11()
+                    if raw and raw != seen:
+                        seen = raw
+                        classify_copy(path, mode, raw)
+        except KeyboardInterrupt:
+            pass
+        if mode == "gear":
+            state = read_run_state(path)
+            print(f"Gear rarity total: +{state['gear_iir']}% Increased "
+                  f"Rarity of Items found "
+                  f"(from {state['gear_count']} copied items)")
+        print("Watcher stopped. Run file saved.")
+        return True
+    finally:
+        xlib.XCloseDisplay(dpy)
+
+
 def watch_x11(path, mode):
     """X11 fallback: xclip has no watch mode, so we must poll."""
     seen = None
@@ -345,16 +437,33 @@ def watch_x11(path, mode):
 
 
 def watch(path, mode):
-    tool = clipboard_tool()
-    if tool is None:
+    has_wl = shutil.which("wl-paste") is not None
+    has_xclip = shutil.which("xclip") is not None
+    if not (has_wl or has_xclip):
         sys.exit("No clipboard tool found. Install one:\n"
                  "  sudo apt install wl-clipboard   (Wayland)\n"
                  "  sudo apt install xclip          (X11)")
-    if tool == "wayland":
-        if wayland_watch_supported():
-            watch_wayland(path, mode)
+    # Best: native Wayland event mode (compositor must support the
+    # wlr data-control protocol)
+    if has_wl and wayland_watch_supported():
+        watch_wayland(path, mode)
+        return
+    # Second best: X11/XWayland event mode. Works even on Wayland
+    # desktops without data-control (e.g. GNOME) as long as the game
+    # runs through XWayland (Steam/Proton) and XWayland is reachable.
+    if os.environ.get("DISPLAY"):
+        if watch_x11_events(path, mode):
+            return
+        if shutil.which("xclip") is None:
+            print("  (X11 event mode needs xclip for reading: "
+                  "sudo apt install xclip)")
         else:
-            watch_wayland_poll(path, mode)
+            print("  (XWayland not reachable yet - if the game is "
+                  "Steam/Proton, START THE GAME FIRST and rerun the "
+                  "logger to get zero-polling capture)")
+    # Last resort: polling (may cause in-game focus flicker)
+    if has_wl:
+        watch_wayland_poll(path, mode)
     else:
         watch_x11(path, mode)
 
