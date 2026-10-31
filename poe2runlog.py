@@ -30,6 +30,18 @@ Workflow (easiest possible):
 No pip dependencies. Requires wl-clipboard (Wayland) or xclip (X11):
     sudo apt install wl-clipboard
 
+How the watcher works (important if you had in-game interference):
+- On Wayland the watcher is EVENT-DRIVEN: a single persistent
+  'wl-paste --watch' process notifies us only when the clipboard
+  changes. Nothing is polled, so the game keeps full keyboard focus.
+  Earlier versions spawned 'wl-paste' every 0.4s; each spawn made the
+  game window briefly lose keyboard focus, which caused item tooltips
+  to close after 1-2 seconds and the Ctrl hotbar swap key to appear to
+  toggle on/off while held. Do not go back to polling on Wayland.
+- On X11 (xclip has no watch mode) we poll every POE2_POLL seconds
+  (default 0.5). If you see interference under X11, raise it:
+  POE2_POLL=2.0 python3 poe2runlog.py start
+
 Notes:
 - Only clipboard text that looks like a PoE item (starts with "Item Class:")
   is logged; everything else on your clipboard is ignored.
@@ -54,6 +66,7 @@ RUNS_DIR = os.path.join(BASE_DIR, "runs")
 ITEM_SIG = "Item Class:"
 IIR_RE = re.compile(r"(\d+)\s*%\s*increased Rarity of Items found")
 WS_TIER_RE = re.compile(r"Waystone \(Tier (\d+)\)")
+POLL_SECONDS = float(os.environ.get("POE2_POLL", "0.5"))
 
 
 def now_iso():
@@ -64,19 +77,25 @@ def ensure_runs_dir():
     os.makedirs(RUNS_DIR, exist_ok=True)
 
 
+def clipboard_tool():
+    if shutil.which("wl-paste"):
+        return "wayland"
+    if shutil.which("xclip"):
+        return "x11"
+    return None
+
+
 def clipboard_get():
-    """Return current clipboard text, or None. Wayland first, X11 fallback."""
-    for cmd in (["wl-paste", "--no-newline"],
-                ["xclip", "-o", "-selection", "clipboard"]):
-        if not shutil.which(cmd[0]):
-            continue
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=2)
-            if proc.returncode == 0:
-                return proc.stdout
-        except Exception:
-            continue
+    """Polling read (X11 fallback only). Wayland uses event mode instead."""
+    if shutil.which("xclip") is None:
+        return None
+    try:
+        proc = subprocess.run(["xclip", "-o", "-selection", "clipboard"],
+                              capture_output=True, text=True, timeout=2)
+        if proc.returncode == 0:
+            return proc.stdout
+    except Exception:
+        pass
     return None
 
 
@@ -120,6 +139,148 @@ def append(path, record):
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def read_run_state(path):
+    """Rebuild waystone/tablet/loot/gear state from the run file.
+
+    The Wayland watcher is a single 'wl-paste --watch' parent with a fresh
+    helper process per clipboard event, so state is persisted in the run
+    file itself and rebuilt here. This also makes the logger robust
+    against crashes: nothing in memory is authoritative.
+    """
+    state = {"used_waystone": False, "loot_seen": False,
+             "tablets_used": 0, "gear_iir": 0, "gear_count": 0}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "item":
+                    continue
+                role = rec.get("role")
+                if role == "waystone_used":
+                    state["used_waystone"] = True
+                elif role == "tablet_used":
+                    state["tablets_used"] += 1
+                elif role == "loot":
+                    state["loot_seen"] = True
+                elif role == "gear" and rec.get("iir"):
+                    state["gear_iir"] += rec["iir"]
+                    state["gear_count"] += 1
+    except FileNotFoundError:
+        pass
+    return state
+
+
+def classify_copy(path, mode, raw):
+    """Parse a clipboard copy, classify it, append it. Returns role or
+    None if the text is not a PoE item."""
+    if ITEM_SIG not in raw:
+        return None
+    state = read_run_state(path)
+    item = parse_item(raw) or {}
+    rec = {"t": now_iso(), "type": "item", "raw": raw}
+    rec.update(item)
+    if mode == "gear":
+        rec["role"] = "gear"
+        state["gear_iir"] += item.get("iir", 0)
+        state["gear_count"] += 1
+    else:
+        hay = ((item.get("item_class") or "") + " " +
+               (item.get("base_type") or "")).lower()
+        if "waystone" in hay and not state["used_waystone"]:
+            rec["role"] = "waystone_used"
+        elif ("tablet" in hay and not state["loot_seen"]
+              and state["tablets_used"] < 4):
+            rec["role"] = "tablet_used"
+        else:
+            rec["role"] = "loot"
+    append(path, rec)
+    if mode == "gear":
+        append(path, {"t": now_iso(), "type": "gear_total",
+                      "iir": state["gear_iir"], "items": state["gear_count"]})
+        print(f"  logged: {item.get('base_type') or '?'}  ->  gear "
+              f"(running total +{state['gear_iir']}%)")
+    else:
+        print(f"  logged: {item.get('base_type') or '?'}  ->  {rec['role']}")
+    return rec["role"]
+
+
+def cmd_oncopy(path, mode):
+    """Called (by wl-paste --watch) with the new clipboard text on stdin."""
+    raw = sys.stdin.read()
+    try:
+        classify_copy(path, mode, raw)
+    except Exception as exc:
+        print(f"  (failed to log copy: {exc})", file=sys.stderr)
+
+
+def watch_wayland(path, mode):
+    """Event-driven watcher: one persistent wl-paste process, no polling.
+
+    'wl-paste --watch CMD' runs CMD with the new clipboard content on
+    stdin each time the clipboard changes. Because the parent stays
+    alive for the whole session and no per-poll subprocess is spawned,
+    the game never loses keyboard focus.
+    """
+    cmd = ["wl-paste", "--no-newline", "--watch",
+           sys.executable, os.path.abspath(__file__), "_oncopy", path, mode]
+    proc = subprocess.Popen(cmd)
+    print("Watching clipboard (event-driven). Ctrl+C here to stop.")
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if mode == "gear":
+        state = read_run_state(path)
+        print(f"Gear rarity total: +{state['gear_iir']}% Increased Rarity "
+              f"of Items found (from {state['gear_count']} copied items)")
+    print("Watcher stopped. Run file saved.")
+
+
+def watch_x11(path, mode):
+    """X11 fallback: xclip has no watch mode, so we must poll."""
+    seen = None
+    print(f"Watching clipboard (polling every {POLL_SECONDS}s, X11 mode). "
+          "Ctrl+C here to stop.")
+    try:
+        while True:
+            raw = clipboard_get()
+            if raw is not None and raw != seen:
+                seen = raw
+                classify_copy(path, mode, raw)
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        pass
+    if mode == "gear":
+        state = read_run_state(path)
+        print(f"Gear rarity total: +{state['gear_iir']}% Increased Rarity "
+              f"of Items found (from {state['gear_count']} copied items)")
+    print("Watcher stopped. Run file saved.")
+
+
+def watch(path, mode):
+    tool = clipboard_tool()
+    if tool is None:
+        sys.exit("No clipboard tool found. Install one:\n"
+                 "  sudo apt install wl-clipboard   (Wayland)\n"
+                 "  sudo apt install xclip          (X11)")
+    if tool == "wayland":
+        watch_wayland(path, mode)
+    else:
+        watch_x11(path, mode)
+
+
 def latest_run():
     ensure_runs_dir()
     files = sorted(f for f in os.listdir(RUNS_DIR)
@@ -127,59 +288,6 @@ def latest_run():
     if not files:
         sys.exit("No run files yet. Start with: python3 poe2runlog.py start")
     return os.path.join(RUNS_DIR, files[-1])
-
-
-def watch(path, mode):
-    seen = None
-    used_waystone = False
-    loot_seen = False
-    tablets_used = 0
-    gear_total = 0
-    gear_count = 0
-    if shutil.which("wl-paste") is None and shutil.which("xclip") is None:
-        sys.exit("No clipboard tool found. Install one:\n"
-                 "  sudo apt install wl-clipboard   (Wayland)\n"
-                 "  sudo apt install xclip          (X11)")
-    print("Watching clipboard. Ctrl+C here to stop.")
-    try:
-        while True:
-            raw = clipboard_get()
-            if raw is not None and raw != seen:
-                seen = raw
-                if ITEM_SIG in raw:
-                    item = parse_item(raw) or {}
-                    rec = {"t": now_iso(), "type": "item", "raw": raw}
-                    rec.update(item)
-                    if mode == "gear":
-                        rec["role"] = "gear"
-                        if item.get("iir"):
-                            gear_total += item["iir"]
-                            gear_count += 1
-                    else:
-                        hay = ((item.get("item_class") or "") + " " +
-                               (item.get("base_type") or "")).lower()
-                        if "waystone" in hay and not used_waystone:
-                            rec["role"] = "waystone_used"
-                            used_waystone = True
-                        elif ("tablet" in hay and not loot_seen
-                              and tablets_used < 4):
-                            rec["role"] = "tablet_used"
-                            tablets_used += 1
-                        else:
-                            rec["role"] = "loot"
-                            loot_seen = True
-                    append(path, rec)
-                    label = item.get("base_type") or "?"
-                    print(f"  logged: {label}  ->  {rec['role']}")
-            time.sleep(0.4)
-    except KeyboardInterrupt:
-        pass
-    if mode == "gear":
-        append(path, {"t": now_iso(), "type": "gear_total",
-                      "iir": gear_total, "items": gear_count})
-        print(f"Gear rarity total: +{gear_total}% Increased Rarity of Items "
-              f"found (from {gear_count} copied items)")
-    print("Watcher stopped. Run file saved.")
 
 
 def cmd_start():
@@ -245,6 +353,8 @@ def main():
     cmd = sys.argv[1].lower()
     if cmd == "start":
         cmd_start()
+    elif cmd == "_oncopy" and len(sys.argv) >= 4:
+        cmd_oncopy(sys.argv[2], sys.argv[3])
     elif cmd == "note" and len(sys.argv) > 2:
         cmd_note(" ".join(sys.argv[2:]))
     elif cmd == "gear":
