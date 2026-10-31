@@ -92,17 +92,36 @@ def clipboard_tool():
 
 
 def clipboard_get():
-    """Polling read (X11 fallback only). Wayland uses event mode instead."""
-    if shutil.which("xclip") is None:
-        return None
-    try:
-        proc = subprocess.run(["xclip", "-o", "-selection", "clipboard"],
-                              capture_output=True, text=True, timeout=2)
-        if proc.returncode == 0:
-            return proc.stdout
-    except Exception:
-        pass
+    """One-shot clipboard read. Works on both Wayland (plain read, no
+    --watch) and X11."""
+    if shutil.which("wl-paste"):
+        try:
+            proc = subprocess.run(["wl-paste", "--no-newline"],
+                                  capture_output=True, text=True, timeout=2)
+            if proc.returncode == 0:
+                return proc.stdout
+        except Exception:
+            pass
+    if shutil.which("xclip"):
+        try:
+            proc = subprocess.run(["xclip", "-o", "-selection", "clipboard"],
+                                  capture_output=True, text=True, timeout=2)
+            if proc.returncode == 0:
+                return proc.stdout
+        except Exception:
+            pass
     return None
+
+
+def wayland_watch_supported():
+    """True if this compositor supports the wlr data-control protocol
+    that 'wl-paste --watch' needs (GNOME, among others, does not)."""
+    try:
+        proc = subprocess.run(["wl-paste", "--watch", "true"],
+                              capture_output=True, text=True, timeout=5)
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 
 def parse_item(raw):
@@ -275,6 +294,35 @@ def watch_wayland(path, mode):
     print("Watcher stopped. Run file saved.")
 
 
+def watch_wayland_poll(path, mode):
+    """Wayland polling fallback for compositors WITHOUT wlr data-control
+    (e.g. GNOME). Polls a plain 'wl-paste' read every POE2_POLL seconds.
+
+    This is the same design as the original logger, which some users
+    found caused in-game focus flicker (tooltips closing, Ctrl hotbar
+    toggling). If you see that, either raise the interval:
+      POE2_POLL=2.0 python3 poe2runlog.py start
+    or run the game under a wlroots-compatible session where the
+    event-driven watcher is used instead."""
+    seen = None
+    print(f"Watching clipboard (Wayland polling, every {POLL_SECONDS}s - "
+          "compositor lacks watch support). Ctrl+C here to stop.")
+    try:
+        while True:
+            raw = clipboard_get()
+            if raw is not None and raw != seen:
+                seen = raw
+                classify_copy(path, mode, raw)
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        pass
+    if mode == "gear":
+        state = read_run_state(path)
+        print(f"Gear rarity total: +{state['gear_iir']}% Increased Rarity "
+              f"of Items found (from {state['gear_count']} copied items)")
+    print("Watcher stopped. Run file saved.")
+
+
 def watch_x11(path, mode):
     """X11 fallback: xclip has no watch mode, so we must poll."""
     seen = None
@@ -303,7 +351,10 @@ def watch(path, mode):
                  "  sudo apt install wl-clipboard   (Wayland)\n"
                  "  sudo apt install xclip          (X11)")
     if tool == "wayland":
-        watch_wayland(path, mode)
+        if wayland_watch_supported():
+            watch_wayland(path, mode)
+        else:
+            watch_wayland_poll(path, mode)
     else:
         watch_x11(path, mode)
 
