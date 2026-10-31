@@ -232,21 +232,42 @@ def watch_wayland(path, mode):
     stdin each time the clipboard changes. Because the parent stays
     alive for the whole session and no per-poll subprocess is spawned,
     the game never loses keyboard focus.
+
+    Note: --no-newline CANNOT be combined with --watch (wl-clipboard
+    errors out immediately); the watched copy includes the trailing
+    newline, which parse_item tolerates.
     """
-    cmd = ["wl-paste", "--no-newline", "--watch",
+    cmd = ["wl-paste", "--watch",
            sys.executable, os.path.abspath(__file__), "_oncopy", path, mode]
-    proc = subprocess.Popen(cmd)
     print("Watching clipboard (event-driven). Ctrl+C here to stop.")
+    restarts = 0
     try:
-        proc.wait()
+        while True:
+            proc = subprocess.Popen(cmd)
+            try:
+                rc = proc.wait()
+            except KeyboardInterrupt:
+                raise
+            if rc == 0:
+                # clean exit (e.g. wl-paste --watch stopping because the
+                # clipboard manager went away); restart to keep watching
+                pass
+            else:
+                print(f"  (wl-paste exited with code {rc}; restarting)")
+            restarts += 1
+            if restarts > 10:
+                sys.exit("wl-paste keeps exiting; run 'wl-paste --watch echo test' "
+                         "in another terminal to debug.")
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     if mode == "gear":
         state = read_run_state(path)
         print(f"Gear rarity total: +{state['gear_iir']}% Increased Rarity "
