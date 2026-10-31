@@ -38,6 +38,12 @@ Units (verified against live responses): exchange primaryValue is in
 Divine Orbs (divine=1); item overview primaryValue is in Exalted Orbs
 despite the response core claiming divine - item values are converted
 with the exchange Exalted rate. Raw responses go to data/raw/.
+
+This tool is a personal, non-commercial helper. It runs completely
+separate from the game, reads only the clipboard you explicitly copy
+to, sends no input to the game, and reads no game files or memory.
+This product isn't affiliated with or endorsed by Grinding Gear
+Games in any way.
 """
 
 import datetime

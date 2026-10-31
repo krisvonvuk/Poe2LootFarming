@@ -49,6 +49,12 @@ Notes:
   quick parser misses a field; the agent re-parses raw text later.
 - A run_start record is written when the watcher starts, so the agent
   gets an accurate session start time even if you copy nothing for a while.
+
+This tool is a personal, non-commercial helper. It runs completely
+separate from the game, reads only the clipboard you explicitly copy
+to, sends no input to the game, and reads no game files or memory.
+This product isn't affiliated with or endorsed by Grinding Gear
+Games in any way.
 """
 
 import datetime

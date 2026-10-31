@@ -64,6 +64,12 @@ Examples:
   python3 poe2strategy.py recommend "essences" --build squishy --tier 15
   python3 poe2strategy.py stats
   python3 poe2strategy.py chart --patch 0.5.5
+
+This tool is a personal, non-commercial helper. It runs completely
+separate from the game, reads only the clipboard you explicitly copy
+to, sends no input to the game, and reads no game files or memory.
+This product isn't affiliated with or endorsed by Grinding Gear
+Games in any way.
 """
 
 import json
