@@ -73,6 +73,7 @@ ITEM_SIG = "Item Class:"
 IIR_RE = re.compile(r"(\d+)\s*%\s*increased Rarity of Items found")
 WS_TIER_RE = re.compile(r"Waystone \(Tier (\d+)\)")
 POLL_SECONDS = float(os.environ.get("POE2_POLL", "0.5"))
+WATCHDOG_SECONDS = float(os.environ.get("POE2_WATCHDOG", "2.0"))
 
 
 def now_iso():
@@ -403,22 +404,27 @@ def watch_x11_events(path, mode):
             return None
 
         last_watchdog = time.monotonic()
+        events_seen = 0
         try:
             while True:
                 if not xlib.XPending(dpy):
-                    # watchdog: one cheap read every 30s as a safety net
-                    # for any missed owner-change event (2 reads/min,
-                    # imperceptible next to the old 2-per-second polling)
-                    if time.monotonic() - last_watchdog >= 30.0:
+                    # watchdog: a regular read as the safety net for missed
+                    # owner-change events. xclip reads go through XWayland
+                    # only (not the Wayland compositor), so they do not
+                    # cause the in-game focus flicker that wl-paste
+                    # polling did. Default every 2s; tune with POE2_WATCHDOG
+                    if time.monotonic() - last_watchdog >= WATCHDOG_SECONDS:
                         last_watchdog = time.monotonic()
                         raw = clipboard_get_x11()
                         if raw and raw != seen:
                             seen = raw
+                            print("  (captured via watchdog)")
                             classify_copy(path, mode, raw)
                     time.sleep(0.1)
                     continue
                 xlib.XNextEvent(dpy, ev)
                 if ev_type[0] == event_base.value:
+                    events_seen += 1
                     raw = read_new()
                     if raw:
                         seen = raw
@@ -426,6 +432,7 @@ def watch_x11_events(path, mode):
                     last_watchdog = time.monotonic()
         except KeyboardInterrupt:
             pass
+        print(f"  ({events_seen} clipboard-change events received)")
         if mode == "gear":
             state = read_run_state(path)
             print(f"Gear rarity total: +{state['gear_iir']}% Increased "
