@@ -74,6 +74,8 @@ IIR_RE = re.compile(r"(\d+)\s*%\s*increased Rarity of Items found")
 WS_TIER_RE = re.compile(r"Waystone \(Tier (\d+)\)")
 POLL_SECONDS = float(os.environ.get("POE2_POLL", "0.5"))
 WATCHDOG_SECONDS = float(os.environ.get("POE2_WATCHDOG", "2.0"))
+CLIPBOARD_MANAGERS = ("copyq", "gpaste", "klipper", "clipman", "parcellite",
+                      "clipit", "xclip")
 
 
 def now_iso():
@@ -324,6 +326,24 @@ def watch_wayland_poll(path, mode):
     print("Watcher stopped. Run file saved.")
 
 
+def clipboard_manager_running():
+    """True if a clipboard manager is running. A clipboard manager takes
+    ownership of every copy, so clipboard reads are served by the manager
+    instead of the game - without one, every read makes the game serve
+    data, which on Proton/XWayland causes a brief focus flicker (held
+    keys appear to release, tooltips close)."""
+    import subprocess
+    for name in CLIPBOARD_MANAGERS:
+        try:
+            proc = subprocess.run(["pgrep", "-x", name],
+                                   capture_output=True, timeout=2)
+            if proc.returncode == 0:
+                return name
+        except Exception:
+            continue
+    return None
+
+
 def clipboard_get_x11():
     """One-shot clipboard read preferring the X11 path (for XWayland
     games this avoids touching the Wayland compositor at all)."""
@@ -386,21 +406,35 @@ def watch_x11_events(path, mode):
 
         print("Watching clipboard (X11/XWayland events, zero polling). "
               "Ctrl+C here to stop.")
+        mgr = clipboard_manager_running()
+        if mgr:
+            print(f"  clipboard manager detected: {mgr} (reads are served "
+                  "by it, not the game - no focus flicker)")
+        else:
+            print("  WARNING: no clipboard manager detected.")
+            print("  Without one, every clipboard read makes the GAME serve")
+            print("  the data, which briefly disturbs it (held Ctrl appears")
+            print("  to release, tooltips may close). Fix once, for good:")
+            print("    sudo apt install copyq")
+            print("    copyq &   (or add CopyQ to Startup Applications)")
+            print("  CopyQ takes ownership of every copy, so reads never touch")
+            print("  the game. Restart this watcher after starting CopyQ.")
         seen = None
         ev = (c_long * 24)()
         ev_type = ctypes.cast(ev, ctypes.POINTER(c_int))
 
         def read_new():
             """Read the clipboard; return text if it is new content,
-            else None. Retries for up to ~1s: right after an owner-change
+            else None. Retries a few times: right after an owner-change
             event the new owner may not have finished serving the data
-            yet, and a single early read can return stale content (the
-            previous copy) - the stall-until-click bug."""
-            for _ in range(10):
+            yet. With a clipboard manager running, the first read always
+            succeeds. Without one, each read makes the game serve data,
+            so keep retries low to limit focus flicker."""
+            for _ in range(5):
                 raw = clipboard_get_x11()
                 if raw and raw != seen:
                     return raw
-                time.sleep(0.1)
+                time.sleep(0.2)
             return None
 
         last_watchdog = time.monotonic()
