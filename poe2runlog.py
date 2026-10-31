@@ -388,20 +388,42 @@ def watch_x11_events(path, mode):
         seen = None
         ev = (c_long * 24)()
         ev_type = ctypes.cast(ev, ctypes.POINTER(c_int))
+
+        def read_new():
+            """Read the clipboard; return text if it is new content,
+            else None. Retries for up to ~1s: right after an owner-change
+            event the new owner may not have finished serving the data
+            yet, and a single early read can return stale content (the
+            previous copy) - the stall-until-click bug."""
+            for _ in range(10):
+                raw = clipboard_get_x11()
+                if raw and raw != seen:
+                    return raw
+                time.sleep(0.1)
+            return None
+
+        last_watchdog = time.monotonic()
         try:
             while True:
                 if not xlib.XPending(dpy):
+                    # watchdog: one cheap read every 30s as a safety net
+                    # for any missed owner-change event (2 reads/min,
+                    # imperceptible next to the old 2-per-second polling)
+                    if time.monotonic() - last_watchdog >= 30.0:
+                        last_watchdog = time.monotonic()
+                        raw = clipboard_get_x11()
+                        if raw and raw != seen:
+                            seen = raw
+                            classify_copy(path, mode, raw)
                     time.sleep(0.1)
                     continue
                 xlib.XNextEvent(dpy, ev)
                 if ev_type[0] == event_base.value:
-                    # owner changed: give the new owner a moment to
-                    # finish serving the data, then read once
-                    time.sleep(0.15)
-                    raw = clipboard_get_x11()
-                    if raw and raw != seen:
+                    raw = read_new()
+                    if raw:
                         seen = raw
                         classify_copy(path, mode, raw)
+                    last_watchdog = time.monotonic()
         except KeyboardInterrupt:
             pass
         if mode == "gear":
